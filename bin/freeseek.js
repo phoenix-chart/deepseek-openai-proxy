@@ -494,6 +494,7 @@ async function dispatchDeepSeekCompletion(prompt, messages, tools, baseHeaders, 
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const sessionId = targetSessionId || await getOrCreateSession(token, baseHeaders);
+      console.log(`  [Session] ${targetSessionId ? "pinned" : "auto"} -> ${sessionId}`);
 
       const refFileIds = [];
       if (imageUrls.length > 0) {
@@ -624,6 +625,7 @@ async function handleChatCompletion(body, token, res) {
   const model = body.model || "deepseek-reasoner";
   const isFastMode = model.toLowerCase().includes("chat") || model.toLowerCase().includes("flash");
   const thinkingEnabled = !isFastMode;
+  const pinnedSessionId = typeof body.deepseek_session_id === "string" && body.deepseek_session_id.trim().length > 0 ? body.deepseek_session_id.trim() : null;
 
   const prompt = formatPromptWithTools(messages, tools);
 
@@ -662,7 +664,7 @@ async function handleChatCompletion(body, token, res) {
     let dsResponse = null;
     let activeSessionId = null;
     try {
-      const dispatchResult = await dispatchDeepSeekCompletion(prompt, messages, tools, baseHeaders, token, thinkingEnabled, imageUrls);
+      const dispatchResult = await dispatchDeepSeekCompletion(prompt, messages, tools, baseHeaders, token, thinkingEnabled, imageUrls, { sessionId: pinnedSessionId });
       dsResponse = dispatchResult.response;
       activeSessionId = dispatchResult.sessionId;
     } catch (dispatchErr) {
@@ -778,6 +780,25 @@ async function handleChatCompletion(body, token, res) {
                 }
               }
 
+              // DeepSeek announces a new fragment type with a plain snapshot event (no "o").
+              // shortcut: one fragment per type; track fragment ids if DeepSeek starts sending more.
+              if (data.p === "response/fragments" && data.o !== "APPEND" && Array.isArray(data.v) && data.v.length > 0) {
+                const last = data.v[data.v.length - 1];
+                const nextType = last && last.type;
+                if (nextType && nextType !== currentFragmentType) {
+                  currentFragmentType = nextType;
+                  const c = (last && last.content) || "";
+                  if (c) {
+                    if (nextType === "THINK") {
+                      accumulatedThinkText += c;
+                      emitStreamDelta(res, completionId, model, createdTimestamp, "THINK", c);
+                    } else {
+                      await handleResponseChunk(c);
+                    }
+                  }
+                }
+              }
+
               if (data.v && typeof data.v === "string" && (!data.p || !data.p.includes("status"))) {
                 if (currentFragmentType === "THINK") {
                   accumulatedThinkText += data.v;
@@ -865,7 +886,7 @@ async function handleChatCompletion(body, token, res) {
   } else {
     // Non-streaming Response
     try {
-      const dispatchResult = await dispatchDeepSeekCompletion(prompt, messages, tools, baseHeaders, token, thinkingEnabled, imageUrls);
+      const dispatchResult = await dispatchDeepSeekCompletion(prompt, messages, tools, baseHeaders, token, thinkingEnabled, imageUrls, { sessionId: pinnedSessionId });
       const dsResponse = dispatchResult.response;
       const activeSessionId = dispatchResult.sessionId;
       let lastResponseMsgId = null;
@@ -907,6 +928,20 @@ async function handleChatCompletion(body, token, res) {
                 const c = data.v[0].content || "";
                 if (currentFragmentType === "THINK") thinkAccumulated += c;
                 else responseAccumulated += c;
+              }
+              // DeepSeek announces a new fragment type with a plain snapshot event (no "o").
+              // shortcut: one fragment per type; track fragment ids if DeepSeek starts sending more.
+              if (data.p === "response/fragments" && data.o !== "APPEND" && Array.isArray(data.v) && data.v.length > 0) {
+                const last = data.v[data.v.length - 1];
+                const nextType = last && last.type;
+                if (nextType && nextType !== currentFragmentType) {
+                  currentFragmentType = nextType;
+                  const c = (last && last.content) || "";
+                  if (c) {
+                    if (nextType === "THINK") thinkAccumulated += c;
+                    else responseAccumulated += c;
+                  }
+                }
               }
               if (data.v && typeof data.v === "string" && (!data.p || !data.p.includes("status"))) {
                 if (currentFragmentType === "THINK") thinkAccumulated += data.v;
